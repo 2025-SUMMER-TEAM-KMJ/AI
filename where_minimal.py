@@ -7,8 +7,8 @@ model = genai.GenerativeModel("models/gemini-2.5-flash")
 
 BUCKET_SET = {
     "security","design","product","marketing","sales","cs",
-    "data_engineering","ai_ml","frontend","backend","legal","logistics","hr",
-    "manufacturing"
+    "data","ai_ml","frontend","backend","legal","logistics","hr",
+    "manufacturing", "strategy_exec", "video_editing"
 }
 
 # JSON 예시 등 리터럴 중괄호는 모두 {{ }} 로 이스케이프
@@ -19,14 +19,14 @@ PROMPT = """너는 채용 추천용 필터 추출기야.
 - bucket: 아래 목록 중 하나(단일값)
 - buckets: 아래 목록 중 2개 이상(복수값이 더 자연스러울 때 사용)
   [security, design, product, marketing, sales, cs,
-   data_engineering, ai_ml, frontend, backend, legal, logistics, hr, manufacturing]
+   data, ai_ml, frontend, backend, legal, logistics, hr, manufacturing, strategy_exec, video_editing]
 - location: 시/도 명칭 (예: "서울", "경기", "부산", "인천" 등)
 - district: 시/군/구 명칭을 그대로 (예: "강남구", "성남시", "분당구", "도봉구" 등)
 
 규칙:
 - 존재하는 키만 포함(없으면 아예 생략)
 - 값은 문자열(bucket) 또는 문자열 배열(buckets)
-- 애매하면 bucket 대신 **buckets**로 여러 개 제시
+- 애매하면 bucket 대신 **buckets**로 여러 개 제시, 하지만 자바스크립트처럼 확실히 프론트인건 bucket 
 - JSON 객체 한 줄만 출력하고 다른 텍스트 금지
 
 참고 지명 유추 예시:
