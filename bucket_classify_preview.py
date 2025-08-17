@@ -22,6 +22,29 @@ MONGO_URI = "mongodb://root:root@35.192.157.46:27017/?authSource=admin"
 DB_NAME = "db"
 COLL_NAME = "master_job_postings"
 
+# ===== 연봉 표준화 =====
+def standardize_company_salary(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    company.avgSalary (연, 원 단위 정수) → 200만원 단위 버킷 라벨
+    """
+    comp = doc.get("company") or {}
+    val = comp.get("avgSalary")
+    if not isinstance(val, (int, float)) or val <= 0:
+        return {}
+
+    y = int(val)
+    BIN = 2_000_000
+    start = (y // BIN) * BIN
+    end = start + BIN
+
+    def to_man(x: int) -> int:
+        return int(round(x / 10_000))
+
+    return {
+        "salary_bucket_2m_label": f"{to_man(start):,}만~{to_man(end):,}만"
+    }
+
+
 # ===== 금칙어 =====
 # (선택) 플래그 공통화
 FLAGS = re.IGNORECASE
@@ -248,7 +271,7 @@ def main(limit: Optional[int] = None, save: bool = False):
     print(f"[BACKFILL] location set: {cnt_loc}, district set: {cnt_dist}")
 
     # ===== (2) 분류 수행 + bucket/위치 저장 =====
-    cursor = col.find({}, {"_id":1, "job":1, "position":1, "detail":1, "address":1, "location":1, "district":1}).limit(limit or 0)
+    cursor = col.find({}, {"_id":1, "job":1, "position":1, "detail":1, "address":1, "location":1, "district":1, "company":1, "avgSalary":1}).limit(limit or 0)
 
     results = []
     for doc in cursor:
@@ -263,6 +286,10 @@ def main(limit: Optional[int] = None, save: bool = False):
                 to_set["location"] = (doc.get("location") or addr.get("location")).strip()
             if (doc.get("district") or addr.get("district")):
                 to_set["district"] = (doc.get("district") or addr.get("district")).strip()
+
+            sal = standardize_company_salary(doc)
+            to_set.update(sal)
+
             col.update_one({"_id": doc["_id"]}, {"$set": to_set})
 
     # ===== (3) 통계/로그 =====
