@@ -1,9 +1,13 @@
-# main.py (청크 인덱싱 + where_minimal 사용 + 전문 복원/전체 청크 보기)
+# main2.py (청크 인덱싱 + where_minimal 사용 + 점수기반 질의; 반환은 job_id 리스트)
+from __future__ import annotations
+
+from typing import List, Dict, Any, Tuple
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
 from chromadb import Client
 import chromadb.config
 import re
+import numpy as np
 from where_minimal import build_where_from_llm
 
 # ── 설정(전역 상수) ──
@@ -23,7 +27,7 @@ vc_collection = vc_client.get_or_create_collection(
 )
 
 # ── 주소 유틸 ──
-def pick_address(doc):
+def pick_address(doc: Dict[str, Any]) -> Dict[str, Any]:
     a = doc.get("address") or {}
     if isinstance(a, dict) and any(a.values()):
         return a
@@ -79,7 +83,7 @@ raw_docs = list(collection.find({}, {
 }))
 
 # ── 문서 → 텍스트/메타 ──
-def build_blocks_and_meta(doc):
+def build_blocks_and_meta(doc: Dict[str, Any]) -> Tuple[list, dict]:
     company = doc.get("company") or {}
     detail = doc.get("detail") or {}
     position = detail.get("position") or {}
@@ -104,7 +108,6 @@ def build_blocks_and_meta(doc):
     job_value = ", ".join(job_list) if isinstance(job_list, list) else (job_list or "")
     job_group = (position.get("jobGroup") or "").strip()
 
-    # 연봉 폴백: 문서→회사→엔트리
     salary = (
         doc.get("avgSalary")
         or company.get("avgSalary")
@@ -130,7 +133,7 @@ def build_blocks_and_meta(doc):
         f"URL: {doc.get('externalUrl') or ''}",
     ]
 
-    meta = {}
+    meta: Dict[str, Any] = {}
     if company_name: meta["company"] = company_name
     if location:     meta["location"] = location
     if district:     meta["district"] = district
@@ -142,7 +145,7 @@ def build_blocks_and_meta(doc):
     return blocks, meta
 
 # ── 문단 기반 청킹 ──
-def chunk_by_paragraph_blocks(blocks, max_chars=MAX_CHARS, overlap_chars=OVERLAP_CHARS):
+def chunk_by_paragraph_blocks(blocks: list, max_chars=MAX_CHARS, overlap_chars=OVERLAP_CHARS) -> list:
     chunks, cur = [], ""
     for b in blocks:
         add_len = (2 if cur else 0) + len(b)
@@ -159,11 +162,8 @@ def chunk_by_paragraph_blocks(blocks, max_chars=MAX_CHARS, overlap_chars=OVERLAP
         chunks.append(cur)
     return chunks
 
-# ── 전문 복원: 청크 이어 붙이며 오버랩 제거 ──
+# ── 전문 복원(필요 시 사용 가능) ──
 def stitch_chunks(pairs, overlap_chars=OVERLAP_CHARS) -> str:
-    """
-    pairs: [(idx, ch_doc, ch_meta), ...]  idx 오름차순 정렬 가정
-    """
     if not pairs:
         return ""
     stitched = pairs[0][1] or ""
@@ -183,11 +183,10 @@ model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 def _collection_empty(c) -> bool:
     try:
-        # 일부 드라이버에선 count()가 느릴 수 있어 n_results=1로 질의
         got = c.get(include=["ids"], limit=1)
         return len(got.get("ids", [])) == 0
     except Exception:
-        return True  # 실패하면 비었다고 보고 최초 인덱싱 진행
+        return True
 
 if (not INDEX_IF_EMPTY_ONLY) or _collection_empty(vc_collection):
     chunk_docs, chunk_ids, chunk_metas = [], [], []
@@ -204,13 +203,8 @@ if (not INDEX_IF_EMPTY_ONLY) or _collection_empty(vc_collection):
     if chunk_docs:
         embeddings = model.encode(chunk_docs).tolist()
         vc_collection.add(documents=chunk_docs, ids=chunk_ids, embeddings=embeddings, metadatas=chunk_metas)
-        print(f"[INDEX] added chunks: {len(chunk_docs)}")
-    else:
-        print("[INDEX] nothing to add")
-else:
-    print("[INDEX] skipped (collection not empty)")
 
-# ── (1) 모든 청크 가져오기 ──
+# ── (1) 모든 청크(필요 시) ──
 def _get_all_chunks(source_id: str):
     got = vc_collection.get(
         where={"source_id": source_id},
@@ -228,7 +222,7 @@ def _get_all_chunks(source_id: str):
     pairs.sort(key=lambda x: x[0])
     return pairs
 
-# ── (2) 대표 청크(c0)만 가져오기 ──
+# ── (2) 대표 청크(c0)(필요 시) ──
 def _get_head_chunk(source_id: str):
     got = vc_collection.get(
         ids=[f"{source_id}::c0"],
@@ -238,79 +232,81 @@ def _get_head_chunk(source_id: str):
     metas = got.get("metadatas", [])
     return (docs[0] if docs else None), (metas[0] if metas else {})
 
-# ── (3) search 함수: view='stitched' | 'chunks' ──
-def search(query: str,
-           top_k: int = 3,
-           show_all_chunks: bool = False,
-           view: str = "chunks",
-           per_source_limit: int | None = None,
-           truncate_chars: int | None = None):
-    qe = model.encode([query]).tolist()
-    where_cond = build_where_from_llm(query) or None
+# ── (공통) L2 정규화 ──
+def _l2norm(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v, ord=2, axis=-1, keepdims=True) + 1e-12
+    return v / n
 
-    raw = vc_collection.query(
-        query_embeddings=qe,
-        n_results=max(top_k * 5, 50),
-        include=["documents", "metadatas", "distances"],
-        **({"where": where_cond} if where_cond else {})
+# ── score 기반 통일 쿼리 (코사인 유사도 직접 계산) ──
+def query_with_scores(
+    collection,
+    query_text: str,
+    encoder,                      # SentenceTransformer
+    where: dict | None = None,
+    n_results: int = 50,
+) -> list:
+    q = np.asarray(encoder.encode([query_text]))
+    q = _l2norm(q)[0]
+
+    raw = collection.query(
+        query_embeddings=q.reshape(1, -1).tolist(),
+        n_results=n_results,
+        include=["documents", "metadatas", "embeddings"],
+        **({"where": where} if where else {})
     )
 
-    print("WHERE:", where_cond)
+    docs   = raw.get("documents", [[]])[0]
+    metas  = raw.get("metadatas", [[]])[0]
+    embs   = raw.get("embeddings", [[]])[0]
+    if not docs:
+        return []
 
-    docs  = raw.get("documents", [[]])[0]
-    metas = raw.get("metadatas", [[]])[0]
-    dists = raw.get("distances", [[]])[0]
+    E = _l2norm(np.asarray(embs))
+    scores = (E @ q)
 
-    # 소스(문서) 단위로 베스트 청크를 잡아 문서 랭킹
-    best_by_source = {}
-    for doc, meta, dist in zip(docs, metas, dists):
+    items = [{"doc": d, "meta": m, "score": float(s)}
+             for d, m, s in zip(docs, metas, scores)]
+    items.sort(key=lambda x: x["score"], reverse=True)
+    return items
+
+# ── (3) search: 상위 문서의 job_id(source_id)만 반환 ──
+def search(query: str,
+           top_k: int = 3) -> List[str]:
+    """
+    입력 query로 검색하고, score 기준 상위 문서의 job_id(source_id)만 반환.
+    """
+    where_cond = build_where_from_llm(query) or None
+
+    items = query_with_scores(
+        collection=vc_collection,
+        query_text=query,
+        encoder=model,
+        where=where_cond,
+        n_results=max(top_k * 5, 50),
+    )
+
+    # 문서 단위 최고 점수만 유지
+    best_by_source: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+    for it in items:
+        meta = it["meta"] or {}
         sid = meta.get("source_id")
         if not sid:
             continue
-        if sid not in best_by_source or dist < best_by_source[sid][0]:
-            best_by_source[sid] = (dist, meta)
+        sc = it["score"]
+        if (sid not in best_by_source) or (sc > best_by_source[sid][0]):
+            best_by_source[sid] = (sc, meta)
 
-    ranked = sorted(best_by_source.items(), key=lambda x: x[1][0])[:top_k]
-
-    for rank, (sid, (dist, _meta)) in enumerate(ranked, 1):
-        if show_all_chunks:
-            all_pairs = _get_all_chunks(sid)  # [(idx, ch_doc, ch_meta), ...] idx 오름차순
-            print(f"\n=== Result #{rank} (distance={dist:.4f}) — source_id={sid} / {len(all_pairs)} chunks ===")
-
-            if view == "stitched":
-                # 전문 복원
-                fulltext = stitch_chunks(all_pairs, overlap_chars=OVERLAP_CHARS)
-                if truncate_chars is not None and len(fulltext) > truncate_chars:
-                    fulltext = fulltext[:truncate_chars] + "…"
-                print(fulltext)
-                # 대표 메타 한 번만
-                if all_pairs:
-                    print("Metadata:", all_pairs[0][2])
-            else:
-                # 청크 나열 모드
-                pairs_to_show = all_pairs if per_source_limit is None else all_pairs[:per_source_limit]
-                for idx, ch_doc, ch_meta in pairs_to_show:
-                    body = ch_doc
-                    if truncate_chars is not None and len(body) > truncate_chars:
-                        body = body[:truncate_chars] + "…"
-                    print(f"\n--- Chunk c{idx} ---")
-                    print(body)
-                    print("Metadata:", ch_meta)
-        else:
-            head_doc, head_meta = _get_head_chunk(sid)
-            out_doc  = head_doc if head_doc else "(no c0)"
-            out_meta = head_meta if head_doc else _meta
-            print(f"\nResult #{rank} (distance={dist:.4f})")
-            print(out_doc)
-            print("Metadata:", out_meta)
+    ranked = sorted(best_by_source.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
+    job_ids = [sid for sid, _ in ranked]
+    return job_ids
 
 # ── 실행 예시 ──
 if __name__ == "__main__":
-    search(
-        " 자율 출퇴근할 수 있는 회사 알고 싶어?",
+    # 예시: 상위 3개의 job_id만 출력(출력은 여기서만; 함수 내부는 반환만 함)
+    result_job_ids = search(
+        "자율 출퇴근 가능한 회사 알려줘",
         top_k=3,
-        show_all_chunks=True,     # ← 문서별 모든 청크
-        view="stitched",          # ← 오버랩 제거하여 전문 복원
-        # per_source_limit=None,  # ← 청크 나열 모드에서 문서당 최대 청크 수
-        # truncate_chars=None,    # ← 화면이 너무 길면 자르기
     )
+    print(result_job_ids)
+    # 필요 시 여기서만 출력/로그 활용 가능
+    # print(result_job_ids)
