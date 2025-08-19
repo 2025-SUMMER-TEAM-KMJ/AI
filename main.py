@@ -1,4 +1,4 @@
-# main2.py (청크 인덱싱 + where_minimal 사용 + 점수기반 질의; 반환은 job_id 리스트)
+# main.py (청크 인덱싱 + where_minimal 사용 + 점수기반 질의; 반환은 job_id 리스트)
 from __future__ import annotations
 
 from typing import List, Dict, Any, Tuple
@@ -25,6 +25,10 @@ vc_collection = vc_client.get_or_create_collection(
     "master_job_postings",
     metadata={"hnsw:space": "cosine"}
 )
+
+def _calc_n_results_for_paging(offset: int, limit: int, *, dup_factor: int = 5, floor: int = 100, ceil: int = 2000) -> int:
+    need = (offset + limit) * dup_factor
+    return max(min(max(need, floor), ceil), limit)
 
 # ── 주소 유틸 ──
 def pick_address(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -162,7 +166,7 @@ def chunk_by_paragraph_blocks(blocks: list, max_chars=MAX_CHARS, overlap_chars=O
         chunks.append(cur)
     return chunks
 
-# ── 전문 복원(필요 시 사용 가능) ──
+# ── 전문 복원(필요 시 사용 가능) 현재는 프린트 하지 않기 때문에 사용하지 않는 기능 ──
 def stitch_chunks(pairs, overlap_chars=OVERLAP_CHARS) -> str:
     if not pairs:
         return ""
@@ -204,7 +208,7 @@ if (not INDEX_IF_EMPTY_ONLY) or _collection_empty(vc_collection):
         embeddings = model.encode(chunk_docs).tolist()
         vc_collection.add(documents=chunk_docs, ids=chunk_ids, embeddings=embeddings, metadatas=chunk_metas)
 
-# ── (1) 모든 청크(필요 시) ──
+# ── (1) 모든 청크(필요 시) 현재는 프린트 하지 않기 때문에 사용하지 않는 기능 ──
 def _get_all_chunks(source_id: str):
     got = vc_collection.get(
         where={"source_id": source_id},
@@ -222,7 +226,7 @@ def _get_all_chunks(source_id: str):
     pairs.sort(key=lambda x: x[0])
     return pairs
 
-# ── (2) 대표 청크(c0)(필요 시) ──
+# ── (2) 대표 청크(c0)(필요 시) 현재는 프린트 하지 않기 때문에 사용하지 않는 기능──
 def _get_head_chunk(source_id: str):
     got = vc_collection.get(
         ids=[f"{source_id}::c0"],
@@ -269,44 +273,62 @@ def query_with_scores(
     items.sort(key=lambda x: x["score"], reverse=True)
     return items
 
-# ── (3) search: 상위 문서의 job_id(source_id)만 반환 ──
-def search(query: str,
-           top_k: int = 3) -> List[str]:
+# ── (3) search: 랭킹 전체에서 offset/limit 구간의 job_id(source_id)만 반환 ──
+def search(
+    query: str,
+    *,
+    offset: int,
+    limit: int,
+) -> List[str]:
     """
-    입력 query로 검색하고, score 기준 상위 문서의 job_id(source_id)만 반환.
+    입력 query로 검색하고, score 기준으로 랭킹된 문서의 job_id(source_id)를
+    offset/limit 페이지네이션으로 잘라 반환한다.
     """
     where_cond = build_where_from_llm(query) or None
+
+    # 청크 중복을 감안해 후보를 넉넉히 가져옴
+    n_results = _calc_n_results_for_paging(offset, limit)
 
     items = query_with_scores(
         collection=vc_collection,
         query_text=query,
         encoder=model,
         where=where_cond,
-        n_results=max(top_k * 5, 50),
+        n_results=n_results,
     )
+    if not items:
+        return []
 
-    # 문서 단위 최고 점수만 유지
+    # 문서(source_id) 단위로 dedup하면서 최고 점수만 유지
     best_by_source: Dict[str, Tuple[float, Dict[str, Any]]] = {}
     for it in items:
         meta = it["meta"] or {}
-        sid = meta.get("source_id")
+        sid = meta.get("source_id")  # == job_id (Mongo _id 문자열)
         if not sid:
             continue
         sc = it["score"]
         if (sid not in best_by_source) or (sc > best_by_source[sid][0]):
             best_by_source[sid] = (sc, meta)
 
-    ranked = sorted(best_by_source.items(), key=lambda x: x[1][0], reverse=True)[:top_k]
-    job_ids = [sid for sid, _ in ranked]
+    ranked_all = sorted(best_by_source.items(), key=lambda x: x[1][0], reverse=True)
+    total = len(ranked_all)
+    if total == 0:
+        return []
+
+    # 페이지 슬라이스
+    start = max(0, offset)
+    end = min(total, offset + limit)
+    if start >= total:
+        return []
+
+    job_ids = [sid for sid, _ in ranked_all[start:end]]
     return job_ids
 
 # ── 실행 예시 ──
 if __name__ == "__main__":
-    # 예시: 상위 3개의 job_id만 출력(출력은 여기서만; 함수 내부는 반환만 함)
     result_job_ids = search(
         "자율 출퇴근 가능한 회사 알려줘",
-        top_k=3,
+        offset=0,
+        limit=3,
     )
     print(result_job_ids)
-    # 필요 시 여기서만 출력/로그 활용 가능
-    # print(result_job_ids)
